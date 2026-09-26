@@ -1,197 +1,150 @@
-import sqlite3
-import json
-from flask import Flask, render_template_string, jsonify, request
-import paho.mqtt.client as mqtt
+#include <Arduino.h>
+#include <Wire.h>
+#include <U8g2lib.h>
+#include <Keypad.h>
+#include <DHT.h>
+#include <Preferences.h>
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <time.h>
 
-app = Flask(__name__)
+// HARDWARE PINS
+#define OLED_SDA        21
+#define OLED_SCL        22
+#define DHT_PIN         4
+#define DHT_TYPE        DHT11
+#define SOIL_PIN        34
+#define RELAY_CH1       18 // Valve Relay
+#define RELAY_CH2       19 // Door Relay
 
-# --- MQTT CONFIGURATION ---
-MQTT_BROKER = "broker.hivemq.com"
-MQTT_PORT = 1883
-TOPIC_COMMAND = "hesam/irrigation/cmd"
-TOPIC_STATUS = "hesam/irrigation/status"
+#define RELAY_ON        LOW
+#define RELAY_OFF       HIGH
 
-# --- DATABASE SETUP ---
-def init_db():
-    conn = sqlite3.connect("irrigation.db")
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS sensor_logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            temp REAL,
-            hum REAL,
-            soil INTEGER,
-            valve TEXT,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    conn.commit()
-    conn.close()
+// MQTT
+const char* mqtt_server = "broker.hivemq.com";
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
 
-init_db()
+DHT dht(DHT_PIN, DHT_TYPE);
+Preferences prefs;
 
-# --- MQTT CLIENT SETUP ---
-mqtt_client = mqtt.Client()
+// Global Variables
+bool valveState = false;
+bool autoSoilMode = false;
+byte soilThreshold = 20;
+float lastTemp = 0.0, lastHum = 0.0;
+int lastSoilPercent = 0;
 
-def on_connect(client, userdata, flags, rc):
-    print("[MQTT] Connected to Broker")
-    client.subscribe(TOPIC_STATUS)
+String wifiSSID = "";
+String wifiPASS = "";
 
-def on_message(client, userdata, msg):
-    try:
-        data = json.loads(msg.payload.decode())
-        conn = sqlite3.connect("irrigation.db")
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT INTO sensor_logs (temp, hum, soil, valve) VALUES (?, ?, ?, ?)",
-            (data.get("temp"), data.get("hum"), data.get("soil"), data.get("valve"))
-        )
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        print("[MQTT ERROR]", e)
+unsigned long doorOpenTimer = 0;
+bool doorPulseActive = false;
 
-mqtt_client.on_connect = on_connect
-mqtt_client.on_message = on_message
-mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
-mqtt_client.loop_start()
+void setValve(bool state) {
+  valveState = state;
+  digitalWrite(RELAY_CH1, valveState ? RELAY_ON : RELAY_OFF);
+}
 
-# --- MOBILE RESPONSIVE HTML & PWA TEMPLATE ---
-HTML_TEMPLATE = """
-<!DOCTYPE html>
-<html lang="fa" dir="rtl">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>کنترل آبیاری حسام</title>
-    <meta name="theme-color" content="#0d6efd">
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.0/font/bootstrap-icons.css" rel="stylesheet">
-    <style>
-        body { background-color: #f0f2f5; font-family: system-ui, -apple-system, sans-serif; user-select: none; }
-        .app-header { background: #0d6efd; color: white; padding: 15px; border-radius: 0 0 20px 20px; box-shadow: 0 4px 10px rgba(0,0,0,0.1); }
-        .stat-card { background: white; border-radius: 16px; padding: 15px; border: none; box-shadow: 0 2px 8px rgba(0,0,0,0.05); text-align: center; }
-        .stat-card i { font-size: 1.8rem; margin-bottom: 5px; }
-        .val-text { font-size: 1.4rem; font-weight: bold; }
-        .btn-control { border-radius: 14px; padding: 14px; font-weight: bold; font-size: 1.1rem; box-shadow: 0 4px 8px rgba(0,0,0,0.1); }
-        .valve-on { background-color: #198754; color: white; }
-        .valve-off { background-color: #dc3545; color: white; }
-    </style>
-</head>
-<body>
+void triggerDoorRelay() {
+  digitalWrite(RELAY_CH2, RELAY_ON);
+  doorPulseActive = true;
+  doorOpenTimer = millis();
+}
 
-    <!-- Header -->
-    <div class="app-header text-center mb-3">
-        <h5 class="m-0 fw-bold"><i class="bi bi-droplet-half me-2"></i>سامانه آبیاری حسام</h5>
-        <small class="opacity-75">کنترل از راه دور (Mobile Web App)</small>
-    </div>
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  String msg;
+  for (int i = 0; i < length; i++) msg += (char)payload[i];
 
-    <div class="container px-3">
-        <!-- Status Grid -->
-        <div class="row g-2 mb-3">
-            <div class="col-6">
-                <div class="stat-card">
-                    <i class="bi bi-thermometer-half text-danger"></i>
-                    <div class="text-muted small">دمای محیط</div>
-                    <div class="val-text text-danger" id="temp">-- C°</div>
-                </div>
-            </div>
-            <div class="col-6">
-                <div class="stat-card">
-                    <i class="bi bi-moisture text-info"></i>
-                    <div class="text-muted small">رطوبت هوا</div>
-                    <div class="val-text text-info" id="hum">-- %</div>
-                </div>
-            </div>
-            <div class="col-6">
-                <div class="stat-card">
-                    <i class="bi bi-flower2 text-success"></i>
-                    <div class="text-muted small">رطوبت خاک</div>
-                    <div class="val-text text-success" id="soil">-- %</div>
-                </div>
-            </div>
-            <div class="col-6">
-                <div class="stat-card">
-                    <i class="bi bi-power text-warning"></i>
-                    <div class="text-muted small">وضعیت شیر</div>
-                    <div class="val-text" id="valve">--</div>
-                </div>
-            </div>
-        </div>
+  if (msg == "VALVE_ON") setValve(true);
+  else if (msg == "VALVE_OFF") setValve(false);
+  else if (msg == "OPEN_DOOR") triggerDoorRelay();
+  else if (msg == "AUTO_ON") autoSoilMode = true;
+  else if (msg == "AUTO_OFF") autoSoilMode = false;
+  else if (msg.startsWith("SET_SOIL_")) {
+    soilThreshold = msg.substring(9).toInt();
+  }
+}
 
-        <!-- Controls -->
-        <div class="stat-card p-3 mb-3">
-            <h6 class="fw-bold mb-3"><i class="bi bi-sliders me-1"></i>فرمان سریع</h6>
-            <div class="d-grid gap-2">
-                <button class="btn btn-success btn-control" onclick="sendCommand('VALVE_ON')">
-                    <i class="bi bi-play-circle me-1"></i> باز کردن شیر آبیاری
-                </button>
-                <button class="btn btn-danger btn-control" onclick="sendCommand('VALVE_OFF')">
-                    <i class="bi bi-stop-circle me-1"></i> بستن شیر آبیاری
-                </button>
-            </div>
-        </div>
-    </div>
+void setup() {
+  Serial.begin(115200);
+  pinMode(RELAY_CH1, OUTPUT);
+  pinMode(RELAY_CH2, OUTPUT);
+  digitalWrite(RELAY_CH1, RELAY_OFF);
+  digitalWrite(RELAY_CH2, RELAY_OFF);
 
-    <script>
-        function updateDashboard() {
-            fetch('/api/latest')
-                .then(res => res.json())
-                .then(data => {
-                    if (data) {
-                        document.getElementById('temp').innerText = data.temp + ' C°';
-                        document.getElementById('hum').innerText = data.hum + ' %';
-                        document.getElementById('soil').innerText = data.soil + ' %';
-                        
-                        const valveElem = document.getElementById('valve');
-                        if (data.valve === 'ON') {
-                            valveElem.innerText = 'OPEN';
-                            valveElem.className = 'val-text text-success';
-                        } else {
-                            valveElem.innerText = 'CLOSED';
-                            valveElem.className = 'val-text text-danger';
-                        }
-                    }
-                });
-        }
+  prefs.begin("irrigation", false);
+  wifiSSID = prefs.getString("wifi_ssid", "");
+  wifiPASS = prefs.getString("wifi_pass", "");
 
-        function sendCommand(cmd) {
-            fetch('/api/control', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({command: cmd})
-            });
-        }
+  dht.begin();
 
-        setInterval(updateDashboard, 2000);
-    </script>
-</body>
-</html>
-"""
+  if (wifiSSID.length() > 0) {
+    WiFi.begin(wifiSSID.c_str(), wifiPASS.c_str());
+  }
 
-# --- ROUTES ---
-@app.route('/')
-def home():
-    return render_template_string(HTML_TEMPLATE)
+  mqttClient.setServer(mqtt_server, 1883);
+  mqttClient.setCallback(mqttCallback);
+}
 
-@app.route('/api/latest')
-def get_latest():
-    conn = sqlite3.connect("irrigation.db")
-    cursor = conn.cursor()
-    cursor.execute("SELECT temp, hum, soil, valve FROM sensor_logs ORDER BY id DESC LIMIT 1")
-    row = cursor.fetchone()
-    conn.close()
-    if row:
-        return jsonify({"temp": row[0], "hum": row[1], "soil": row[2], "valve": row[3]})
-    return jsonify(None)
+int getWiFiSignalPercentage() {
+  if (WiFi.status() != WL_CONNECTED) return 0;
+  int rssi = WiFi.RSSI();
+  if (rssi <= -100) return 0;
+  if (rssi >= -50) return 100;
+  return 2 * (rssi + 100);
+}
 
-@app.route('/api/control', methods=['POST'])
-def control():
-    cmd = request.json.get('command')
-    if cmd:
-        mqtt_client.publish(TOPIC_COMMAND, cmd)
-        return jsonify({"status": "success"})
-    return jsonify({"status": "error"}), 400
+void publishStatus() {
+  if (mqttClient.connected()) {
+    String payload = "{\"temp\":" + String(lastTemp) +
+                     ",\"hum\":" + String(lastHum) +
+                     ",\"soil\":" + String(lastSoilPercent) +
+                     ",\"valve\":\"" + (valveState ? "ON" : "OFF") + "\"" +
+                     ",\"wifi_ssid\":\"" + WiFi.SSID() + "\"" +
+                     ",\"wifi_rssi\":" + String(getWiFiSignalPercentage()) + "}";
+    mqttClient.publish("hesam/irrigation/status", payload.c_str());
+  }
+}
 
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+void loop() {
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!mqttClient.connected()) {
+      if (mqttClient.connect("ESP32_Hesam_Client")) {
+        mqttClient.subscribe("hesam/irrigation/cmd");
+      }
+    }
+    mqttClient.loop();
+  }
+
+  // Handle 2-second Pulse for Door Relay
+  if (doorPulseActive && (millis() - doorOpenTimer >= 2000)) {
+    digitalWrite(RELAY_CH2, RELAY_OFF);
+    doorPulseActive = false;
+  }
+
+  // Read Sensors & Soil Thermostat Logic
+  static unsigned long lastRead = 0;
+  if (millis() - lastRead > 2000) {
+    lastRead = millis();
+    float t = dht.readTemperature();
+    float h = dht.readHumidity();
+    if (!isnan(t)) lastTemp = t;
+    if (!isnan(h)) lastHum = h;
+
+    int rawSoil = analogRead(SOIL_PIN);
+    lastSoilPercent = map(rawSoil, 4095, 1500, 0, 100);
+    lastSoilPercent = constrain(lastSoilPercent, 0, 100);
+
+    // Automatic Soil Thermostat Logic
+    if (autoSoilMode) {
+      if (lastSoilPercent < soilThreshold && !valveState) {
+        setValve(true);
+      } else if (lastSoilPercent >= (soilThreshold + 5) && valveState) {
+        setValve(false);
+      }
+    }
+
+    publishStatus();
+  }
+}
